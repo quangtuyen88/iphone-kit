@@ -4,10 +4,22 @@
 
 iPhoneKit streams a connected iPhone's screen over USB and sends pointer and keyboard input over Bluetooth Classic HID. Control the phone from the Mac app, an MCP client, the local REST API, or the built-in vision agent. Nothing is installed on the iPhone; no jailbreak or Developer Mode is required.
 
-[Download](#installation) · [Connect a phone](#connect-an-iphone) · [MCP](#mcp) · [REST API](docs/REST.md) · [Development](#development) · [Known issues](#limitations-and-known-issues)
+[Demo](#demo) · [Download](#installation) · [Connect a phone](#connect-an-iphone) · [MCP](#mcp) · [REST API](docs/REST.md) · [Development](#development) · [Known issues](#limitations-and-known-issues)
 
 > [!IMPORTANT]
 > **v0.1.0 is an experimental preview.** The downloadable app is Apple silicon only, ad-hoc signed, and **not notarized**. Hardware behavior has been tested on macOS 27 / iOS 27; older OS versions remain unverified. Read the [release notes](docs/releases/v0.1.0.md) before using it with a real phone.
+
+## Demo
+
+![iPhoneKit on macOS with a connected iPhone and the Agent panel](docs/media/iphonekit-overview.png)
+
+*Interface overview. This screenshot shows a locked phone; iPhoneKit cannot bypass its passcode.*
+
+**[Watch or download the 30-second TikTok search demo (MP4)](docs/media/iphonekit-tiktok-demo.mp4)**
+
+The clip opens TikTok from iOS app search, enters `vibe code`, and displays the Videos results. It is a silent, real-time recording of the iPhoneKit window, controlled through the local REST API with the phone unlocked beforehand. The built-in Agent panel remains idle; no passcode entry, likes, follows, or comments are recorded.
+
+Search-result videos are not opened. See [known input limitations](#limitations-and-known-issues).
 
 ## Capabilities
 
