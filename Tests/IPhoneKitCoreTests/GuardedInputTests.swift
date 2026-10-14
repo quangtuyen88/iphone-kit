@@ -166,18 +166,18 @@ import Testing
     let transport = GuardRecordingTransport()
     let witness = InputDispatchWitness()
     let gate = GuardGate()
-    let deadline = Date().addingTimeInterval(0.02)
+    var currentTime = Date(timeIntervalSince1970: 1000)
+    let deadline = currentTime.addingTimeInterval(1)
+    let runner = GestureRunner(now: { currentTime })
     let authorization = GuardedInput(witness: witness) { await gate.suspend() }
     let plan = GesturePlan(reports: [TimedReport(milliseconds: 0, bytes: HIDReports.keyboard())])
     let task = Task { @MainActor in
-        try await GestureRunner().run(
+        try await runner.run(
             plan, transport: transport, epoch: 1, deadline: deadline, stillValid: { true }, authorization: authorization)
     }
 
     await gate.waitUntilEntered()
-    await Task.detached {
-        while Date() <= deadline { await Task.yield() }
-    }.value
+    currentTime = deadline
     gate.open()
     do {
         try await task.value
@@ -186,6 +186,7 @@ import Testing
         #expect((error as? KitError)?.code == "DEADLINE_EXCEEDED")
     }
     #expect(transport.sendAttempts == 0)
+    #expect(transport.reports.isEmpty)
     #expect(transport.releases == 0)
     #expect(!witness.didBeginDispatch)
 }

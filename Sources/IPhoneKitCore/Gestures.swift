@@ -153,6 +153,7 @@ protocol ReportTransport: AnyObject {
 @MainActor
 struct GestureRunner {
     var sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    var now: () -> Date = { Date() }
 
     func run(
             _ plan: GesturePlan, transport: any ReportTransport, epoch: UInt64, deadline: Date?,
@@ -162,7 +163,7 @@ struct GestureRunner {
             func checkValidity() throws {
                 try Task.checkCancellation()
                 try authorization?.witness.check()
-                guard deadline.map({ value in value > Date() }) ?? true else {
+                guard deadline.map({ value in value > now() }) ?? true else {
                     throw KitError("DEADLINE_EXCEEDED", "Action deadline expired.")
                 }
                 guard transport.epoch == epoch, transport.isReady, stillValid() else {
