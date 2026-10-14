@@ -39,6 +39,7 @@ final class L2CAPWriter {
     private var queue: [UInt] = []
     private var inFlight: UInt?
     var failed: (() -> Void)?
+    var drained: (() -> Void)?
     var pendingCount: Int { pending.count }
 
     init(
@@ -123,8 +124,10 @@ final class L2CAPWriter {
         guard inFlight == identifier, let write = pending.removeValue(forKey: identifier) else { return }
         inFlight = nil
         if status == kIOReturnSuccess {
+            let becameEmpty = pending.isEmpty
             write.settle(.success(()))
             pump()
+            if becameEmpty, pending.isEmpty { drained?() }
         } else {
             let error = KitError("ACTION_INTERRUPTED", "Input delivery failed. Inspect the phone before retrying.")
             write.settle(.failure(error))

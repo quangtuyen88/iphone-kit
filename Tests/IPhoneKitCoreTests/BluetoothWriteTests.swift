@@ -105,6 +105,54 @@ import Testing
     #expect(throws: KitError.self) { try writer.enqueue(HIDReports.keyboard()) }
 }
 
+@Test @MainActor func cancelledNativeWriteRemainsPendingUntilSuccessfulDrainCallback() async throws {
+    let probe = WriteProbe()
+    let writer = probe.writer()
+    defer { writer.invalidate() }
+    var drains = 0
+    writer.drained = { drains += 1 }
+    let task = Task { @MainActor in try await writer.write(HIDReports.keyboard()) }
+    try await probe.waitForSubmission()
+
+    task.cancel()
+    do {
+        try await task.value
+        Issue.record("Expected cancellation")
+    } catch {
+        #expect(error is CancellationError)
+    }
+    #expect(writer.pendingCount == 1)
+    #expect(drains == 0)
+
+    writer.complete(identifier: probe.identifiers[0], status: kIOReturnSuccess)
+    #expect(writer.pendingCount == 0)
+    #expect(drains == 1)
+    writer.complete(identifier: probe.identifiers[0], status: kIOReturnSuccess)
+    #expect(drains == 1)
+}
+
+@Test @MainActor func recursiveSynchronousPumpNotifiesDrainExactlyOnce() throws {
+    let probe = WriteProbe()
+    let writer = probe.writer()
+    defer { writer.invalidate() }
+    var drains = 0
+    writer.drained = { drains += 1 }
+    try writer.enqueue(HIDReports.keyboard(modifiers: 2))
+    try writer.enqueue(HIDReports.keyboard())
+    #expect(writer.pendingCount == 2)
+    #expect(probe.identifiers.count == 1)
+
+    probe.complete = { [weak writer] identifier in
+        writer?.complete(identifier: identifier, status: kIOReturnSuccess)
+    }
+    writer.complete(identifier: probe.identifiers[0], status: kIOReturnSuccess)
+    #expect(probe.identifiers.count == 2)
+    #expect(writer.pendingCount == 0)
+    #expect(drains == 1)
+    writer.complete(identifier: probe.identifiers[1], status: kIOReturnSuccess)
+    #expect(drains == 1)
+}
+
 @Test @MainActor func synchronousWriteCompletionDoesNotLoseContinuation() async throws {
     let probe = WriteProbe()
     let writer = probe.writer()

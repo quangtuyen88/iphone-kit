@@ -7,7 +7,7 @@ iPhoneKit streams a connected iPhone's screen over USB and sends pointer and key
 [Demo](#demo) · [Download](#installation) · [Connect a phone](#connect-an-iphone) · [MCP](#mcp) · [REST API](docs/REST.md) · [Development](#development) · [Known issues](#limitations-and-known-issues)
 
 > [!IMPORTANT]
-> **v0.1.0 is an experimental preview.** The downloadable app is Apple silicon only, ad-hoc signed, and **not notarized**. Hardware behavior has been tested on macOS 27 / iOS 27; older OS versions remain unverified. Read the [release notes](docs/releases/v0.1.0.md) before using it with a real phone.
+> **v0.1.1 is an experimental preview.** The downloadable app is Apple silicon only, ad-hoc signed, and **not notarized**. Earlier hardware testing used macOS 27 / iOS 27; this release's reconnect and Stop fault cases still need real-device validation. Read the [release notes](docs/releases/v0.1.1.md) before using it with a real phone.
 
 ## Demo
 
@@ -43,7 +43,7 @@ The Mac app owns the USB capture, Bluetooth connection, and platform permissions
 
 ### Download the preview
 
-1. Download `iPhoneKit-0.1.0-macos-arm64.zip` and `SHA256SUMS` from the [v0.1.0 release](https://github.com/quangtuyen88/iphone-kit/releases/tag/v0.1.0).
+1. Download `iPhoneKit-0.1.1-macos-arm64.zip` and `SHA256SUMS` from the [v0.1.1 release](https://github.com/quangtuyen88/iphone-kit/releases/tag/v0.1.1).
 2. Verify the ZIP from the directory containing both downloads:
 
    ```bash
@@ -99,7 +99,11 @@ The **Macros** panel uses local image matching and optional OCR on the Mac. No m
 
 A profile supports up to **20 steps**, **20 loops**, **100 actions**, and a **5–600 second** session, including waits and approvals. Recording and playback own the phone's input exclusively: manual, API, MCP, and keep-awake input cannot interleave. Stop with **Stop** or **Cmd+.**.
 
-Unexpected screens, connection changes, timeouts, or uncertain outcomes pause or stop the run. Inspect the phone before starting again. Use your own account and follow the game's rules; do not include purchases, sign-in, messaging, or account changes in automatic loops. Keep distinctive context in matching regions and avoid the floating AssistiveTouch button.
+Unexpected screens, connection changes, timeouts, or uncertain outcomes pause or stop the run. Before input, a fresh target match and full-screen context check are required, including a check at the queued dispatch boundary. Animations and background changes can pause replay.
+
+Stop waits for pending work to settle. Recovery shows the last verified step and the interrupted command's outcome; inspect the phone and approve a new run before continuing. A new run starts at step 1 and may repeat earlier effects; failed actions are never automatically retried. See [macro safety and validation limits](docs/MACRO-SAFETY.md).
+
+Use your own account and follow the game's rules; do not include purchases, sign-in, messaging, or account changes in automatic loops. Keep distinctive context in matching regions and avoid the floating AssistiveTouch button.
 
 ## Integrations
 
@@ -159,7 +163,7 @@ Cropping a macro's matching region **does not redact the stored screenshot**. Av
 - **Platform coverage:** private Apple interfaces can change with OS updates. Older OS combinations, multi-phone throughput, real-game reliability, and long unattended runs remain unverified. Bluetooth congestion and latency still need hardware testing.
 - **Distribution:** this preview is not notarized. There is no hosted account, subscription service, cloud relay, remote MCP/OAuth, or browser live streaming.
 
-See the [v0.1.0 release notes](docs/releases/v0.1.0.md) for the preview's distribution and compatibility details.
+See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for the preview's distribution and compatibility details.
 
 ## Development
 
@@ -210,7 +214,8 @@ Macro self-tests write `report.json` and `macros.json` to a unique private tempo
 ## Documentation
 
 - [REST API reference](docs/REST.md)
-- [Release notes](docs/releases/v0.1.0.md)
+- [Macro safety and validation limits](docs/MACRO-SAFETY.md)
+- [Release notes](docs/releases/v0.1.1.md)
 - [Platform evidence and original feasibility spike](docs/FEASIBILITY.md)
 
 The original hardware probe remains in `spikes/hid-probe/`, separate from the app.

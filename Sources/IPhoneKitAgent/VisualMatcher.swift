@@ -7,10 +7,29 @@ import IPhoneKitCore
 /// Local, deterministic image matching for visual macro guards. No image or OCR data
 /// leaves this process.
 public protocol VisualMatching: Sendable {
+    /// Compares the anchor's recorded target region (and optional expected text) against
+    /// the live screenshot.
     func matches(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool
+
+    /// Compares the full-screen context around the anchor against the live screenshot.
+    /// Context evidence is supplementary only; it never substitutes for an informative
+    /// target match.
+    func matchesContext(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool
+}
+
+public extension VisualMatching {
+    /// Matchers that do not implement context matching must fail loudly instead of
+    /// silently falling back to the target match.
+    func matchesContext(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool {
+        throw KitError("MACRO_CONTEXT_UNSUPPORTED", "This visual matcher does not support full-screen context matching.")
+    }
 }
 
 public struct LocalVisualMatcher: VisualMatching {
+    /// Full-screen context comparisons never use a tolerance looser than this, regardless
+    /// of the anchor's own target tolerance.
+    internal static let contextToleranceCap = 0.035
+
     public init() {}
 
     /// Validates the encoded image and its decoded thumbnail bounds without retaining it.
@@ -20,8 +39,39 @@ public struct LocalVisualMatcher: VisualMatching {
     }
 
     public func matches(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool {
+        let evaluation = try evaluate(anchor, screenshot: screenshot, region: anchor.region,
+                                      tolerance: anchor.tolerance, requireInformation: true)
+        guard evaluation.pixelMatch else { return false }
+
+        if !anchor.expectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try Task.checkCancellation()
+            let textMatches = try recognized(expected: anchor.expectedText, image: evaluation.live, region: anchor.region)
+            try Task.checkCancellation()
+            guard textMatches else { return false }
+        }
+        return true
+    }
+
+    /// Full-screen pixel comparison with no OCR and a capped tolerance. Flat context is
+    /// allowed here because the informative target match is still required separately.
+    public func matchesContext(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool {
+        let tolerance = min(anchor.tolerance, Self.contextToleranceCap)
+        return try evaluate(anchor, screenshot: screenshot, region: .full,
+                            tolerance: tolerance, requireInformation: false).pixelMatch
+    }
+
+    private struct Evaluation {
+        let pixelMatch: Bool
+        let live: Thumbnail
+    }
+
+    /// Shared validation, decoding, pointer masking and tile comparison for target and
+    /// context matching.
+    private func evaluate(_ anchor: VisualAnchor, screenshot: Screenshot, region: MacroRegion,
+                          tolerance: Double, requireInformation: Bool) throws -> Evaluation {
         try Task.checkCancellation()
         try anchor.validateStored()
+        try MacroValidation.validateRegion(region)
         try MacroValidation.validateScreenshotMetadata(screenshot)
         try MacroValidation.validateImageData(screenshot.jpeg)
         if screenshot.pointerVisible != false, screenshot.pointerX != nil || screenshot.pointerY != nil {
@@ -37,8 +87,8 @@ public struct LocalVisualMatcher: VisualMatching {
         try Task.checkCancellation()
         let live = try decodeThumbnail(screenshot.jpeg)
         try Task.checkCancellation()
-        let recordedSamples = try crop(recorded, region: anchor.region)
-        let liveSamples = try crop(live, region: anchor.region)
+        let recordedSamples = try crop(recorded, region: region)
+        let liveSamples = try crop(live, region: region)
         try Task.checkCancellation()
 
         let livePointer: MacroPoint?
@@ -48,28 +98,22 @@ public struct LocalVisualMatcher: VisualMatching {
         } else {
             livePointer = nil
         }
-        let mask = try buildMask(region: anchor.region, recorded: anchor.pointer, live: livePointer,
+        let mask = try buildMask(region: region, recorded: anchor.pointer, live: livePointer,
                                  sampleCount: recordedSamples.count)
         try Task.checkCancellation()
         guard recordedSamples.values.count == liveSamples.values.count else {
             throw MacroValidation.error("MATCH_FAILED", "The bounded screenshot thumbnails could not be compared.")
         }
-        guard hasInformation(recordedSamples.values, mask: mask) else {
-            throw MacroValidation.error("LOW_INFORMATION_ANCHOR", "The visual anchor contains too little image information to match safely.")
+        if requireInformation {
+            guard hasInformation(recordedSamples.values, mask: mask) else {
+                throw MacroValidation.error("LOW_INFORMATION_ANCHOR", "The visual anchor contains too little image information to match safely.")
+            }
         }
 
         let pixelMatch = compare(recordedSamples.values, liveSamples.values,
-                                 mask: mask, tolerance: anchor.tolerance)
+                                 mask: mask, tolerance: tolerance)
         try Task.checkCancellation()
-        guard pixelMatch else { return false }
-
-        if !anchor.expectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            try Task.checkCancellation()
-            let textMatches = try recognized(expected: anchor.expectedText, image: live, region: anchor.region)
-            try Task.checkCancellation()
-            guard textMatches else { return false }
-        }
-        return true
+        return Evaluation(pixelMatch: pixelMatch, live: live)
     }
 
     private struct Thumbnail {
@@ -195,21 +239,23 @@ public struct LocalVisualMatcher: VisualMatching {
 
     private func hasInformation(_ values: [SIMD3<Float>], mask: [Bool]) -> Bool {
         var count = 0
-        var sum: Float = 0
-        var sumSquares: Float = 0
+        // Double accumulators: Float cancellation in sumSquares/n - mean^2 over 16k
+        // samples can fabricate a non-zero deviation for a perfectly flat image.
+        var sum: Double = 0
+        var sumSquares: Double = 0
         var minimum: Float = 1
         var maximum: Float = 0
         for (index, value) in values.enumerated() where !mask[index] {
             let luminance = value.x * 0.2126 + value.y * 0.7152 + value.z * 0.0722
             count += 1
-            sum += luminance
-            sumSquares += luminance * luminance
+            sum += Double(luminance)
+            sumSquares += Double(luminance) * Double(luminance)
             minimum = min(minimum, luminance)
             maximum = max(maximum, luminance)
         }
         guard count >= 32 else { return false }
-        let mean = sum / Float(count)
-        let variance = max(0, sumSquares / Float(count) - mean * mean)
+        let mean = sum / Double(count)
+        let variance = max(0, sumSquares / Double(count) - mean * mean)
         let deviation = variance.squareRoot()
         // Pure or nearly pure flat-color guards are not safe visual evidence. Keep the
         // threshold low enough for a mostly blank screen with a real control/text edge.

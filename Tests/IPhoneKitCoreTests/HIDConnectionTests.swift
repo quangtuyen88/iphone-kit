@@ -201,6 +201,41 @@ private final class Clock {
     try await task.value
 }
 
+@Test @MainActor func cancelledNativeInterruptWriteDrainsWithoutChangingEpoch() async throws {
+    let device = FakeDevice()
+    let connection = makeConnection(device)
+    defer { connection.invalidate() }
+    let (_, interrupt) = ready(connection)
+    let epoch = connection.epoch
+    let originalTokenCount = interrupt.tokens.count
+    var changes = 0
+    connection.changed = { changes += 1 }
+    let task = Task { @MainActor in
+        try await connection.send(HIDReports.keyboard(modifiers: 2), epoch: epoch, deadline: nil)
+    }
+    while interrupt.tokens.count == originalTokenCount { await Task.yield() }
+
+    #expect(connection.pendingInputWrites == 1)
+    task.cancel()
+    do {
+        try await task.value
+        Issue.record("Expected cancellation")
+    } catch {
+        #expect(error is CancellationError)
+    }
+    #expect(connection.pendingInputWrites == 1)
+    #expect(changes == 0)
+    #expect(connection.epoch == epoch)
+
+    let token = interrupt.tokens[originalTokenCount]
+    connection.writeCompleted(token, status: kIOReturnSuccess)
+    #expect(connection.pendingInputWrites == 0)
+    #expect(changes == 1)
+    #expect(connection.epoch == epoch)
+    connection.writeCompleted(token, status: kIOReturnSuccess)
+    #expect(changes == 1)
+}
+
 @Test @MainActor func liveChannelCloseTearsDownEachPSMOnce() {
     let device = FakeDevice()
     let connection = makeConnection(device)

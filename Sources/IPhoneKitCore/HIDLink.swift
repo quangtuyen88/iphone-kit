@@ -257,6 +257,7 @@ final class HIDConnection: NSObject, @preconcurrency IOBluetoothL2CAPChannelDele
     private var interrupt: (any HIDChannel)?
     private var controlWriter: L2CAPWriter?
     private var interruptWriter: L2CAPWriter?
+        var pendingInputWrites: Int { interruptWriter?.pendingCount ?? 0 }
     /// PSMs the current attempt is opening; any wrapper reporting one open is the same IOBluetooth channel.
     private var awaiting: Set<BluetoothL2CAPPSM> = []
     private var opening: [ObjectIdentifier: (channel: any HIDChannel, attempt: UInt64)] = [:]
@@ -466,16 +467,22 @@ final class HIDConnection: NSObject, @preconcurrency IOBluetoothL2CAPChannelDele
     private func slot(_ psm: BluetoothL2CAPPSM) -> (any HIDChannel)? { psm == 0x11 ? control : interrupt }
 
     private func makeWriter(psm: BluetoothL2CAPPSM) -> L2CAPWriter {
-        let writer = L2CAPWriter { [weak self] buffer, length, refcon in
-            guard let channel = self?.slot(psm) else { return kIOReturnNotOpen }
-            return channel.submit(buffer, length: length, refcon: refcon)
+            let writer = L2CAPWriter { [weak self] buffer, length, refcon in
+                guard let channel = self?.slot(psm) else { return kIOReturnNotOpen }
+                return channel.submit(buffer, length: length, refcon: refcon)
+            }
+            writer.failed = { [weak self, weak writer] in
+                guard let self, let writer, writer === controlWriter || writer === interruptWriter else { return }
+                invalidate(reason: "PSM \(psm) input failed")
+            }
+            if psm == 0x13 {
+                writer.drained = { [weak self, weak writer] in
+                    guard let self, let writer, writer === interruptWriter else { return }
+                    changed?()
+                }
+            }
+            return writer
         }
-        writer.failed = { [weak self, weak writer] in
-            guard let self, let writer, writer === controlWriter || writer === interruptWriter else { return }
-            invalidate(reason: "PSM \(psm) input failed")
-        }
-        return writer
-    }
 
     private func finishOpening() {
         guard enabled, control != nil, interrupt != nil, !isReady else { return }

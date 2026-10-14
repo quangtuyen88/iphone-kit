@@ -64,6 +64,59 @@ private func screenshot(_ jpeg: Data, id: String = UUID().uuidString, pointer: C
     #expect(!(try await matcher.matches(anchor, screenshot: screenshot(outsideChange, pointer: CGPoint(x: 80, y: 160)))))
 }
 
+@Test func contextMatchesWhenLiveScreenIsUnchanged() async throws {
+    let base = try fixtureJPEG()
+    let anchor = try VisualAnchor(screenshot: screenshot(base))
+    let matcher = LocalVisualMatcher()
+    #expect(try await matcher.matches(anchor, screenshot: screenshot(base)))
+    #expect(try await matcher.matchesContext(anchor, screenshot: screenshot(base)))
+}
+
+@Test func croppedTargetMatchesWhileContextRejectsOverlayOutsideCrop() async throws {
+    let base = try fixtureJPEG()
+    // Crop covers x 16...80 px; the overlay sits at x 100...130 px, outside it in any orientation.
+    let crop = MacroRegion(x: 0.1, y: 0.1, width: 0.4, height: 0.4)
+    let anchor = try VisualAnchor(screenshot: screenshot(base), region: crop)
+    let matcher = LocalVisualMatcher()
+    let overlay = try fixtureJPEG(patch: CGRect(x: 100, y: 200, width: 30, height: 30), patchColor: .systemRed)
+    #expect(try await matcher.matches(anchor, screenshot: screenshot(overlay)))
+    #expect(!(try await matcher.matchesContext(anchor, screenshot: screenshot(overlay))))
+}
+
+@Test func highTargetToleranceDoesNotWeakenContextCap() async throws {
+    let base = try fixtureJPEG()
+    let anchor = try VisualAnchor(screenshot: screenshot(base), tolerance: 0.5)
+    let matcher = LocalVisualMatcher()
+    let changed = try fixtureJPEG(patch: CGRect(x: 40, y: 100, width: 40, height: 40), patchColor: .systemRed)
+    // The loose target tolerance accepts the change; the capped context tolerance must not.
+    #expect(try await matcher.matches(anchor, screenshot: screenshot(changed)))
+    #expect(!(try await matcher.matchesContext(anchor, screenshot: screenshot(changed))))
+}
+
+@Test func flatContextMatchesWhileFlatTargetIsRejected() async throws {
+    let flat = try fixtureJPEG(patch: CGRect(x: 0, y: 0, width: 160, height: 320), patchColor: .systemBlue)
+    let anchor = try VisualAnchor(screenshot: screenshot(flat))
+    let matcher = LocalVisualMatcher()
+    await #expect(throws: KitError.self) {
+        _ = try await matcher.matches(anchor, screenshot: screenshot(flat))
+    }
+    #expect(try await matcher.matchesContext(anchor, screenshot: screenshot(flat)))
+}
+
+private struct TargetOnlyMatcher: VisualMatching {
+    func matches(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool { true }
+}
+
+@Test func defaultContextMatchingThrowsInsteadOfFallingBack() async throws {
+    let base = try fixtureJPEG()
+    let anchor = try VisualAnchor(screenshot: screenshot(base))
+    let matcher = TargetOnlyMatcher()
+    #expect(try await matcher.matches(anchor, screenshot: screenshot(base)))
+    await #expect(throws: KitError("MACRO_CONTEXT_UNSUPPORTED", "This visual matcher does not support full-screen context matching.")) {
+        _ = try await matcher.matchesContext(anchor, screenshot: screenshot(base))
+    }
+}
+
 @Test func gestureScalesToFreshScreenshotAndDropsRuntimeMetadata() throws {
     let data = try fixtureJPEG(width: 100, height: 200)
     let first = Screenshot(id: "old", phoneID: "phone", epoch: 1, width: 100, height: 200,

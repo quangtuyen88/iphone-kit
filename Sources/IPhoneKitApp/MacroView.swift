@@ -8,7 +8,14 @@ struct MacroView: View {
     let phone: PhoneInfo?
     @State private var working = false
     @State private var error: String?
-    @State private var review: MacroProfile?
+    @State private var review: MacroReviewRequest?
+
+    private struct MacroReviewRequest: Identifiable {
+        let id = UUID()
+        let profile: MacroProfile
+        let recovery: MacroRecovery?
+        let phoneEpoch: UInt64
+    }
 
     private var workspace: MacroWorkspace { runtime.macros }
 
@@ -21,6 +28,7 @@ struct MacroView: View {
                 if workspace.isBusy {
                     Button("Stop", role: .destructive) { workspace.stop() }
                         .keyboardShortcut(".", modifiers: .command)
+                        .disabled(workspace.runner.state == .stopping)
                 }
             }
             if workspace.runner.state != .idle { runStatus }
@@ -72,10 +80,20 @@ struct MacroView: View {
                             .disabled(workspace.isBusy || working || workspace.storageError != nil || workspace.draft.phoneID.isEmpty)
                         Spacer()
                         Button("Review & run") {
-                            do { try workspace.draft.validate(); review = workspace.draft }
-                            catch { self.error = error.localizedDescription }
+                            do {
+                                try workspace.draft.validate();
+                                if let phone {
+                                    review = MacroReviewRequest(
+                                        profile: workspace.draft,
+                                        recovery: workspace.runner.recovery,
+                                        phoneEpoch: phone.epoch)
+                                }
+                            } catch { self.error = error.localizedDescription }
                         }.buttonStyle(.borderedProminent)
-                            .disabled(workspace.isBusy || working || workspace.draft.steps.isEmpty || phone?.id != workspace.draft.phoneID || phone?.status != .ready || runtime.agent.state.isActive)
+                            .disabled(
+                                workspace.isBusy || working || workspace.draft.steps.isEmpty
+                                    || phone?.id != workspace.draft.phoneID || phone?.status != .ready
+                                    || runtime.agent.state.isActive)
                     }
                     if let error { Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                     if let storageError = workspace.storageError { Text(storageError).font(.caption).foregroundStyle(.red) }
@@ -83,11 +101,25 @@ struct MacroView: View {
                         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.padding(.vertical, 4)
             }
+        }.sheet(item: $review) { request in
+            MacroRunReview(profile: request.profile, recovery: request.recovery) {
+                let currentPhone = runtime.hub.phones.first { candidate in
+                    candidate.id == request.profile.phoneID && candidate.status == .ready
+                }
+                guard !workspace.runner.state.isActive,
+                    workspace.runner.recovery?.id == request.recovery?.id,
+                    currentPhone?.epoch == request.phoneEpoch
+                else {
+                    throw KitError(
+                        "MACRO_REVIEW_STALE", "The phone or interrupted run changed. Cancel and review again.")
+                }
+                try runtime.runMacro(request.profile)
+            }.id(request.id)
         }
-        .sheet(item: $review) { profile in
-            MacroRunReview(profile: profile) {
-                try runtime.runMacro(profile)
-            }
+        .onChange(of: phone?.epoch) { review = nil }
+        .onChange(of: workspace.runner.recovery?.id) { review = nil }
+        .onChange(of: workspace.runner.state.isActive) { _, active in
+            if active { review = nil }
         }
     }
 
@@ -140,7 +172,12 @@ struct MacroView: View {
                 Spacer()
                 Text("\(runner.actionCount) actions").font(.caption.monospacedDigit())
             }
-            Text(runner.message).font(.caption).fixedSize(horizontal: false, vertical: true)
+            if let recovery = runner.recovery, runner.state != .stopping {
+                recoverySummary(recovery)
+            } else {
+                Text(runner.message).font(.caption).fixedSize(horizontal: false, vertical: true)
+            }
+            diagnostics
             if let proposal = runner.proposal {
                 if let image = NSImage(data: proposal.screenshot.jpeg) {
                     Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 145)
@@ -154,6 +191,37 @@ struct MacroView: View {
                 Text("The screen is checked again after approval.").font(.caption2).foregroundStyle(.secondary)
             }
         }.padding(10).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func recoverySummary(_ recovery: MacroRecovery) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Run interrupted", systemImage: "exclamationmark.triangle").font(.caption.weight(.semibold))
+            Text(recovery.reason.message).font(.caption).fixedSize(horizontal: false, vertical: true)
+            Text("Last verified: \(MacroStepPresentation.text(recovery.lastVerifiedStep)) · interrupted: \(MacroStepPresentation.text(recovery.interruptedStep))")
+                .font(.caption2.monospaced()).fixedSize(horizontal: false, vertical: true)
+            Text(recovery.outcome.message).font(.caption).fixedSize(horizontal: false, vertical: true)
+            Text("This describes only the interrupted command. Inspect the phone yourself; nothing is resumed, skipped, or retried. A new run starts at step 1 and may repeat earlier effects.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var diagnostics: some View {
+        let runner = workspace.runner
+        return DisclosureGroup {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Kept in memory only. Contains no photos, screen text, or device identifiers.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                ScrollView {
+                    Text(runner.diagnosticReport).font(.caption2.monospaced()).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 120)
+                Button("Copy diagnostics") { runtime.copy(runner.diagnosticReport) }
+                    .controlSize(.small).disabled(runner.diagnostics.isEmpty)
+            }.padding(.top, 4)
+        } label: {
+            Text("Diagnostics (\(runner.diagnostics.count) events)").font(.caption)
+        }
     }
 
     private func move(_ id: UUID, by offset: Int) {
@@ -248,45 +316,73 @@ private struct VisualAnchorEditor: View {
                 }
                 TextField("Optional required text (local OCR)", text: $anchor.expectedText)
                     .textFieldStyle(.roundedBorder)
-                Text("Keep distinctive context around targets. Small crops can miss popups; flat regions are rejected. Avoid the floating AssistiveTouch button.")
+                Text("The region is the target crop (and OCR crop when text is required). Before each input the full screen is also compared with the recorded context, so a dialog or banner outside the crop pauses the run. Animations, timers, or background changes can pause it too; this is not a guarantee that every popup is detected. Flat regions are rejected. Avoid the floating AssistiveTouch button.")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(.vertical, 6)
         }.font(.caption)
     }
 }
 
+private enum MacroStepPresentation {
+    static func text(_ step: MacroStepProgress?) -> String {
+        guard let step else { return "none" }
+        return "loop \(step.iteration) · step \(step.stepIndex) · \(step.action.rawValue)"
+    }
+}
+
 private struct MacroRunReview: View {
     let profile: MacroProfile
+    let recovery: MacroRecovery?
     let run: () throws -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var acknowledged = false
+    @State private var inspected = false
     @State private var error: String?
+
+    private var canRun: Bool { acknowledged && (recovery == nil || inspected) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Label("Approve a bounded game session", systemImage: "checkmark.shield").font(.title2.weight(.semibold))
-            Text(CommandPresentation.escaped(profile.name)).font(.headline)
-            Text("\(profile.steps.count) steps · \(profile.repetitions) loops · at most \(profile.maximumActions) actions or \(Int(profile.maximumSeconds)) seconds.")
-            Text("Pinned to the recorded phone at \(profile.nativeWidth) × \(profile.nativeHeight). Other input is blocked during playback. Each step must match its recorded screen and result.")
-                .font(.callout).foregroundStyle(.secondary)
             ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(profile.steps.enumerated()), id: \.element.id) { index, step in
-                        Text("\(index + 1). \(CommandPresentation.escaped(step.name)) · \(step.gesture.action.rawValue) · \(step.requiresApproval ? "ask each time" : "automatic")")
-                            .font(.callout)
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(CommandPresentation.escaped(profile.name)).font(.headline)
+                    Text("\(profile.steps.count) steps · \(profile.repetitions) loops · at most \(profile.maximumActions) actions or \(Int(profile.maximumSeconds)) seconds.")
+                    Text("Pinned to the recorded phone at \(profile.nativeWidth) × \(profile.nativeHeight). Other input is blocked during playback. Each step must match its recorded target crop and, before any input, the recorded full-screen context; afterwards the expected result must appear. Animations or background changes can pause the run.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if let recovery {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("The previous run was interrupted", systemImage: "exclamationmark.triangle").font(.callout.weight(.semibold))
+                            Text(recovery.reason.message).font(.caption)
+                            Text("Last verified: \(MacroStepPresentation.text(recovery.lastVerifiedStep)) · interrupted: \(MacroStepPresentation.text(recovery.interruptedStep))")
+                                .font(.caption.monospaced())
+                            Text(recovery.outcome.message).font(.caption)
+                            Text("This describes only the interrupted command. A new run starts at step 1 and may repeat effects the earlier run already caused; nothing is resumed, skipped, or retried.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                     }
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(profile.steps.enumerated()), id: \.element.id) { index, step in
+                            Text("\(index + 1). \(CommandPresentation.escaped(step.name)) · \(step.gesture.action.rawValue) · \(step.requiresApproval ? "ask each time" : "automatic")")
+                                .font(.callout)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    Toggle("I reviewed every step. Automatic steps are gameplay only, not purchases or account changes.", isOn: $acknowledged)
+                    if recovery != nil {
+                        Toggle("I inspected the phone after the interrupted run", isOn: $inspected)
+                    }
+                    Text("Screen recognition is not a guarantee against overlays or a last-moment screen change. Stop with ⌘. and inspect any uncertain outcome. No failed action is automatically retried.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 }.frame(maxWidth: .infinity, alignment: .leading)
-            }.frame(maxHeight: 190)
-            Toggle("I reviewed every step. Automatic steps are gameplay only, not purchases or account changes.", isOn: $acknowledged)
-            Text("Screen recognition is not a guarantee against overlays or a last-moment screen change. Stop with ⌘. and inspect any uncertain outcome. No failed action is automatically retried.")
-                .font(.caption).foregroundStyle(.secondary)
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            }.frame(maxHeight: 450)
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
                 Spacer()
                 Button("Approve & run") {
                     do { try run(); dismiss() } catch { self.error = error.localizedDescription }
-                }.buttonStyle(.borderedProminent).disabled(!acknowledged)
+                }.buttonStyle(.borderedProminent).disabled(!canRun)
             }
         }.padding(26).frame(width: 530)
     }

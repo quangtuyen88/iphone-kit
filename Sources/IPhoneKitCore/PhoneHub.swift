@@ -79,7 +79,13 @@ public final class PhoneHub: ExclusivePhoneControlling {
         UserDefaults.standard.dictionary(forKey: "iPhoneKit.captureBindings") as? [String: String]
         ?? [:]
     }
-    hid.changed = { [weak self] in self?.reconcile() }
+    hid.changed = { [weak self] in
+          guard let self else { return }
+          for phoneID in Array(inputOwnership.keys) {
+            finalizeInputOwnershipIfQuiescent(phoneID: phoneID)
+          }
+          reconcile()
+        }
     hid.diagnostic = { [weak self] message in self?.record(message) }
   }
 
@@ -359,9 +365,9 @@ public final class PhoneHub: ExclusivePhoneControlling {
     let reference: Reference
     if isDemo {
       let (jpeg, width, height) = try demo.jpeg(longEdge: longEdge)
-      result = Screenshot(
-        phoneID: phoneID, epoch: phone.epoch, width: width, height: height, nativeWidth: 390,
-        nativeHeight: 844, capturedAt: Date(), jpeg: jpeg)
+      result = Screenshot(phoneID: phoneID, epoch: phone.epoch, width: width, height: height, nativeWidth: 390,
+                                 nativeHeight: 844, capturedAt: Date(), jpeg: jpeg,
+                                 capturedUptime: ProcessInfo.processInfo.systemUptime)
       reference = Reference(
         phoneID: phoneID, epoch: phone.epoch, captureID: nil, generation: 0,
         geometry: ImageGeometry(width: width, height: height, nativeWidth: 390, nativeHeight: 844),
@@ -387,12 +393,10 @@ public final class PhoneHub: ExclusivePhoneControlling {
         epoch: epoch, captureID: bindings[phoneID], generation: frame.geometryGeneration,
         currentGeneration: screen.frame(captureID: captureID)?.geometryGeneration)
       let pointer = pointers[phoneID]
-      result = Screenshot(
-        phoneID: phoneID, epoch: epoch, width: frame.width, height: frame.height,
-        nativeWidth: frame.nativeWidth, nativeHeight: frame.nativeHeight,
-        capturedAt: frame.capturedAt, jpeg: frame.jpeg,
-        pointerX: pointer.map { $0.0 * Double(frame.width) },
-        pointerY: pointer.map { $0.1 * Double(frame.height) })
+      result = Screenshot(phoneID: phoneID, epoch: epoch, width: frame.width, height: frame.height,
+                                 nativeWidth: frame.nativeWidth, nativeHeight: frame.nativeHeight,
+                                 capturedAt: frame.capturedAt, jpeg: frame.jpeg, pointerX: pointer.map { $0.0 * Double(frame.width) }, pointerY: pointer.map { $0.1 * Double(frame.height) },
+                                 capturedUptime: frame.uptime)
       reference = Reference(
         phoneID: phoneID, epoch: epoch, captureID: captureID, generation: frame.geometryGeneration,
         geometry: ImageGeometry(
@@ -406,46 +410,48 @@ public final class PhoneHub: ExclusivePhoneControlling {
   }
 
   public func acquireInput(phoneID: String) throws -> PhoneInputLease {
-    guard started, !stopping else {
-      throw KitError("PHONE_OFFLINE", "Phone is not connected.")
-    }
-    reconcile()
-    guard let phone = phones.first(where: { $0.id == phoneID }) else {
-      throw KitError("PHONE_OFFLINE", "Phone is not connected.")
-    }
-    guard phone.status == .ready else {
-      throw KitError("PHONE_NOT_READY", "The iPhone is not ready for exclusive input.")
-    }
-    finalizeInputOwnershipIfQuiescent(phoneID: phoneID)
-    if let owner = inputOwnership[phoneID], owner.phase == .active {
-      throw KitError("INPUT_OWNED", "Phone input is owned by a visual macro.")
-    }
-    guard inputOwnership[phoneID] == nil,
-      (activeInputExecutions[phoneID] ?? 0) == 0,
-      (queues[phoneID]?.depth ?? 0) == 0
-    else {
-      throw KitError("INPUT_BUSY", "Phone input is already in use or still draining.")
-    }
-    inputGeneration &+= 1
-    let generation = inputGeneration
-    let token = UUID()
-    inputOwnership[phoneID] = InputOwnership(token: token, generation: generation, phase: .active)
-    record("Exclusive visual-macro input acquired for \(phone.name); keep-awake pulses paused.")
-    return PhoneInputLease(
-      phoneID: phoneID,
-      execute: { [weak self] command in
-        guard let self else { throw KitError("PHONE_OFFLINE", "Phone controller is unavailable.") }
-        return try await self.executeOwned(
-          phoneID: phoneID, command: command, ownerToken: token, generation: generation)
-      },
-      cancel: { [weak self] in
-        self?.cancelInputLease(phoneID: phoneID, ownerToken: token, generation: generation)
-      },
-      release: { [weak self] in
-        self?.releaseInputLease(phoneID: phoneID, ownerToken: token, generation: generation)
+      guard started, !stopping else {
+        throw KitError("PHONE_OFFLINE", "Phone is not connected.")
       }
-    )
-  }
+      reconcile()
+      guard let phone = phones.first(where: { value in value.id == phoneID }) else {
+        throw KitError("PHONE_OFFLINE", "Phone is not connected.")
+      }
+      guard phone.status == .ready else {
+        throw KitError("PHONE_NOT_READY", "The iPhone is not ready for exclusive input.")
+      }
+      finalizeInputOwnershipIfQuiescent(phoneID: phoneID)
+      if let owner = inputOwnership[phoneID], owner.phase == .active {
+        throw KitError("INPUT_OWNED", "Phone input is owned by a visual macro.")
+      }
+      guard inputOwnership[phoneID] == nil, inputWorkIsDrained(phoneID: phoneID) else {
+        throw KitError("INPUT_BUSY", "Phone input is already in use or still draining.")
+      }
+      inputGeneration &+= 1
+      let generation = inputGeneration
+      let token = UUID()
+      inputOwnership[phoneID] = InputOwnership(token: token, generation: generation, phase: .active)
+      record("Exclusive visual-macro input acquired; keep-awake pulses paused.")
+      return PhoneInputLease(
+        phoneID: phoneID,
+        execute: { [weak self] command in
+          guard let self else { throw KitError("PHONE_OFFLINE", "Phone controller is unavailable.") }
+          return try await executeOwned(phoneID: phoneID, command: command, ownerToken: token, generation: generation)
+        },
+        guardedExecute: { [weak self] command, authorization in
+          guard let self else { throw KitError("PHONE_OFFLINE", "Phone controller is unavailable.") }
+          return try await executeOwned(phoneID: phoneID, command: command, ownerToken: token,
+                                        generation: generation, authorization: authorization)
+        },
+        isDrained: { [weak self] in self?.inputWorkIsDrained(phoneID: phoneID) ?? true },
+        cancel: { [weak self] in
+          self?.cancelInputLease(phoneID: phoneID, ownerToken: token, generation: generation)
+        },
+        release: { [weak self] in
+          self?.releaseInputLease(phoneID: phoneID, ownerToken: token, generation: generation)
+        }
+      )
+    }
 
   private func validateInputEntry(phoneID: String, ownerToken: UUID?, generation: UInt64?) throws {
     if let ownerToken, let generation {
@@ -506,13 +512,20 @@ public final class PhoneHub: ExclusivePhoneControlling {
     }
   }
 
-  private func finalizeInputOwnershipIfQuiescent(phoneID: String) {
-    guard let owner = inputOwnership[phoneID], owner.phase != .active,
-      (activeInputExecutions[phoneID] ?? 0) == 0,
-      (queues[phoneID]?.depth ?? 0) == 0
-    else { return }
-    inputOwnership.removeValue(forKey: phoneID)
+  private func inputWorkIsDrained(phoneID: String) -> Bool {
+    let address = attached.first(where: { phone in phone.id == phoneID })?.bluetoothAddress
+    let pendingWrites =
+      address.flatMap { value in hid.connections[normalizedBluetoothAddress(value)] }?.pendingInputWrites ?? 0
+    return (activeInputExecutions[phoneID] ?? 0) == 0
+      && (queues[phoneID]?.depth ?? 0) == 0 && pendingWrites == 0
   }
+
+  private func finalizeInputOwnershipIfQuiescent(phoneID: String) {
+      guard let owner = inputOwnership[phoneID], owner.phase != .active,
+        inputWorkIsDrained(phoneID: phoneID)
+      else { return }
+      inputOwnership.removeValue(forKey: phoneID)
+    }
 
   private func cancelInputLease(phoneID: String, ownerToken: UUID, generation: UInt64) {
     guard var owner = inputOwnership[phoneID], owner.token == ownerToken,
@@ -577,190 +590,170 @@ public final class PhoneHub: ExclusivePhoneControlling {
   }
 
   private func executeOwned(
-    phoneID: String, command: PhoneCommand, ownerToken: UUID, generation: UInt64
-  ) async throws -> ActionResult {
-    try await executeInput(
-      phoneID: phoneID, command: command, ownerToken: ownerToken, generation: generation)
-  }
+      phoneID: String, command: PhoneCommand, ownerToken: UUID, generation: UInt64,
+      authorization: GuardedInput? = nil
+    ) async throws -> ActionResult {
+      try await executeInput(phoneID: phoneID, command: command, ownerToken: ownerToken,
+                             generation: generation, authorization: authorization)
+    }
 
   private func executeInput(
-    phoneID: String, command: PhoneCommand, ownerToken: UUID?, generation: UInt64?
-  ) async throws -> ActionResult {
-    guard started, !stopping, phones.contains(where: { $0.id == phoneID }) else {
-      throw KitError("PHONE_OFFLINE", "Phone is not connected.")
-    }
-    try validateInputEntry(phoneID: phoneID, ownerToken: ownerToken, generation: generation)
-    if let key = command.idempotencyKey {
-      guard (1...128).contains(key.utf8.count) else {
-        throw KitError("INVALID_KEY", "idempotency_key must contain 1–128 bytes.")
+      phoneID: String, command: PhoneCommand, ownerToken: UUID?, generation: UInt64?,
+      authorization: GuardedInput? = nil
+    ) async throws -> ActionResult {
+      guard started, !stopping, phones.contains(where: { phone in phone.id == phoneID }) else {
+        throw KitError("PHONE_OFFLINE", "Phone is not connected.")
       }
-      let scopedKey = phoneID + ":" + key
-      if let entry = cached[scopedKey] {
-        let context = try beginInputExecution(
-          phoneID: phoneID, ownerToken: ownerToken, generation: generation)
-        defer { finishInputExecution(phoneID: phoneID) }
-        guard entry.command == command else {
-          throw KitError(
-            "IDEMPOTENCY_CONFLICT", "This idempotency key already names a different action.")
+      try validateInputEntry(phoneID: phoneID, ownerToken: ownerToken, generation: generation)
+      if let key = command.idempotencyKey {
+        guard (1...128).contains(key.utf8.count) else {
+          throw KitError("INVALID_KEY", "idempotency_key must contain 1–128 bytes.")
         }
-        _ = context
-        return try await entry.task.value
-      }
-      while cached.count >= 256, !completedKeys.isEmpty {
-        cached.removeValue(forKey: completedKeys.removeFirst())
-      }
-      guard cached.count < 256 else {
-        throw KitError("QUEUE_FULL", "Too many actions are pending.")
-      }
-      let context = try beginInputExecution(
-        phoneID: phoneID, ownerToken: ownerToken, generation: generation)
-      let task = Task { @MainActor [self] in
-        defer { finishInputExecution(phoneID: phoneID) }
-        return try await perform(phoneID: phoneID, command: command, context: context)
-      }
-      cached[scopedKey] = CachedAction(
-        command: command, task: task, ownerToken: ownerToken, generation: generation)
-      defer {
-        if let entry = cached[scopedKey], entry.ownerToken == ownerToken,
-          entry.generation == generation
-        {
-          completedKeys.append(scopedKey)
+        let scopedKey = phoneID + ":" + key
+        if let entry = cached[scopedKey] {
+          let context = try beginInputExecution(phoneID: phoneID, ownerToken: ownerToken, generation: generation)
+          defer { finishInputExecution(phoneID: phoneID) }
+          guard entry.command == command else {
+            throw KitError("IDEMPOTENCY_CONFLICT", "This idempotency key already names a different action.")
+          }
+          _ = context
+          return try await entry.task.value
         }
+        while cached.count >= 256, !completedKeys.isEmpty {
+          cached.removeValue(forKey: completedKeys.removeFirst())
+        }
+        guard cached.count < 256 else { throw KitError("QUEUE_FULL", "Too many actions are pending.") }
+        let context = try beginInputExecution(phoneID: phoneID, ownerToken: ownerToken, generation: generation)
+        let task = Task { @MainActor [self] in
+          defer { finishInputExecution(phoneID: phoneID) }
+          return try await perform(phoneID: phoneID, command: command, context: context, authorization: authorization)
+        }
+        cached[scopedKey] = CachedAction(command: command, task: task, ownerToken: ownerToken, generation: generation)
+        defer {
+          if let entry = cached[scopedKey], entry.ownerToken == ownerToken, entry.generation == generation {
+            completedKeys.append(scopedKey)
+          }
+        }
+        return try await task.value
       }
-      return try await task.value
+      let context = try beginInputExecution(phoneID: phoneID, ownerToken: ownerToken, generation: generation)
+      defer { finishInputExecution(phoneID: phoneID) }
+      return try await perform(phoneID: phoneID, command: command, context: context, authorization: authorization)
     }
-    let context = try beginInputExecution(
-      phoneID: phoneID, ownerToken: ownerToken, generation: generation)
-    defer { finishInputExecution(phoneID: phoneID) }
-    return try await perform(phoneID: phoneID, command: command, context: context)
-  }
 
-  private func perform(phoneID: String, command: PhoneCommand, context: InputExecutionContext)
-    async throws -> ActionResult
-  {
-    try requireInputContext(phoneID: phoneID, context: context)
-    reconcile()
-    try requireInputContext(phoneID: phoneID, context: context)
-    guard let currentPhone = phones.first(where: { $0.id == phoneID }) else {
-      throw KitError("PHONE_OFFLINE", "Phone is not connected.")
-    }
-    if command.action != .wake, currentPhone.status != .ready {
-      let code = currentPhone.status == .needsWake ? "PHONE_ASLEEP" : "PHONE_NOT_READY"
-      throw KitError(
-        code,
-        "The iPhone is not ready for input; no command was sent. Wake it or restore its screen connection first."
-      )
-    }
-    let reference: Reference?
-    if command.action.usesCoordinates {
-      guard let id = command.screenshotID, let value = references[id], value.phoneID == phoneID
-      else {
-        throw KitError(
-          "SCREENSHOT_REQUIRED",
-          "Take a screenshot and pass its screenshot_id with pointer actions.")
+  private func perform(
+      phoneID: String, command: PhoneCommand, context: InputExecutionContext,
+      authorization: GuardedInput? = nil
+    ) async throws -> ActionResult {
+      try requireInputContext(phoneID: phoneID, context: context)
+      reconcile()
+      try requireInputContext(phoneID: phoneID, context: context)
+      guard let currentPhone = phones.first(where: { phone in phone.id == phoneID }) else {
+        throw KitError("PHONE_OFFLINE", "Phone is not connected.")
       }
-      reference = value
-    } else {
-      reference = nil
-    }
-    let plan = try GesturePlan.build(command, geometry: reference?.geometry)
-    let connection: HIDConnection?
-    if isDemo {
-      connection = nil
-    } else {
-      if command.action == .wake,
-        let address = attached.first(where: { $0.id == phoneID })?.bluetoothAddress
-      {
+      if command.action != .wake, currentPhone.status != .ready {
+        let code = currentPhone.status == .needsWake ? "PHONE_ASLEEP" : "PHONE_NOT_READY"
+        throw KitError(code, "The iPhone is not ready for input. Wake it or restore its screen connection first.")
+      }
+      let reference: Reference?
+      if command.action.usesCoordinates {
+        guard let id = command.screenshotID, let value = references[id], value.phoneID == phoneID else {
+          throw KitError("SCREENSHOT_REQUIRED", "Take a screenshot and pass its screenshot_id with pointer actions.")
+        }
+        reference = value
+      } else {
+        reference = nil
+      }
+      let plan = try GesturePlan.build(command, geometry: reference?.geometry)
+      let connection: HIDConnection?
+      if isDemo {
+        connection = nil
+      } else {
+        if command.action == .wake,
+          let address = attached.first(where: { phone in phone.id == phoneID })?.bluetoothAddress
+        {
+          try requireInputContext(phoneID: phoneID, context: context)
+          try hid.startService()
+          prepared.insert(phoneID)
+          let wakeLink = hid.connection(address: address)
+          wakeLink.enabled = true
+          wakeLink.connect(userInitiated: true)
+          for _ in 0..<50 where !wakeLink.isReady {
+            try Task.checkCancellation()
+            try requireInputContext(phoneID: phoneID, context: context)
+            try await Task.sleep(for: .milliseconds(100))
+          }
+        }
         try requireInputContext(phoneID: phoneID, context: context)
-        try hid.startService()
-        prepared.insert(phoneID)
-        let wakeLink = hid.connection(address: address)
-        wakeLink.enabled = true
-        wakeLink.connect(userInitiated: true)
-        for _ in 0..<50 where !wakeLink.isReady {
+        guard prepared.contains(phoneID),
+          let address = attached.first(where: { phone in phone.id == phoneID })?.bluetoothAddress,
+          let current = hid.connections[normalizedBluetoothAddress(address)], current.isReady
+        else {
+          throw KitError("BLUETOOTH_DISCONNECTED", "Enable control and pair this Mac in iPhone Settings > Bluetooth.")
+        }
+        connection = current
+      }
+      try requireInputContext(phoneID: phoneID, context: context)
+      reconcile()
+      let expected = epochs[phoneID] ?? 0
+      let linkEpoch = connection?.epoch ?? 0
+      let deadline = command.deadline ?? Date().addingTimeInterval(65)
+      let queue = queues[phoneID] ?? CommandQueue()
+      queues[phoneID] = queue
+      try requireInputContext(phoneID: phoneID, context: context)
+      return try await queue.submit { [self] in
+        let start = Date()
+        try requireInputContext(phoneID: phoneID, context: context)
+        guard !stopping, epochs[phoneID] == expected, deadline > start else {
+          throw KitError("CONNECTION_CHANGED", "Action expired or connection changed while queued. Take a fresh screenshot.")
+        }
+        @MainActor func valid() -> Bool {
+          guard inputContextIsValid(phoneID: phoneID, context: context), !stopping,
+            epochs[phoneID] == expected
+          else { return false }
+          guard let current = phones.first(where: { phone in phone.id == phoneID }),
+            command.action == .wake || current.status == .ready
+          else { return false }
+          guard let reference else { return isDemo || attached.contains(where: { phone in phone.id == phoneID }) }
+          guard Date().timeIntervalSince(reference.capturedAt) <= 60, reference.epoch == expected else { return false }
+          if isDemo { return true }
+          guard let captureID = reference.captureID, bindings[phoneID] == captureID,
+            let frame = screen.frame(captureID: captureID), frame.geometryGeneration == reference.generation,
+            ProcessInfo.processInfo.systemUptime - frame.uptime < 3
+          else { return false }
+          return true
+        }
+        guard valid() else { throw KitError("STALE_SCREENSHOT", "Screen changed or screenshot expired. Take a fresh screenshot.") }
+        if let connection {
+          try await GestureRunner().run(plan, transport: connection, epoch: linkEpoch,
+                                        deadline: deadline, stillValid: valid, authorization: authorization)
+        } else {
+          try Task.checkCancellation()
+          try await Task.sleep(for: .milliseconds(20))
+          try await authorization?.authorize()
           try Task.checkCancellation()
           try requireInputContext(phoneID: phoneID, context: context)
-          try await Task.sleep(for: .milliseconds(100))
+          guard valid() else { throw KitError("CONNECTION_CHANGED", "Screen or connection changed during validation.") }
+          guard deadline > Date() else { throw KitError("DEADLINE_EXCEEDED", "Action deadline expired.") }
+          try authorization?.witness.beginDispatch()
+          if command.action == .tap {
+            demo.checked.toggle()
+            demo.home = false
+          }
+          if command.action == .typeText { demo.text += command.text ?? "" }
+          if command.action == .pressHome { demo.home = true }
         }
-      }
-      try requireInputContext(phoneID: phoneID, context: context)
-      guard prepared.contains(phoneID),
-        let address = attached.first(where: { $0.id == phoneID })?.bluetoothAddress,
-        let current = hid.connections[normalizedBluetoothAddress(address)], current.isReady
-      else {
-        throw KitError(
-          "BLUETOOTH_DISCONNECTED",
-          "Enable control and pair this Mac in iPhone Settings > Bluetooth.")
-      }
-      connection = current
-    }
-    try requireInputContext(phoneID: phoneID, context: context)
-    reconcile()
-    let expected = epochs[phoneID] ?? 0
-    let linkEpoch = connection?.epoch ?? 0
-    let deadline = command.deadline ?? Date().addingTimeInterval(65)
-    let queue = queues[phoneID] ?? CommandQueue()
-    queues[phoneID] = queue
-    try requireInputContext(phoneID: phoneID, context: context)
-    return try await queue.submit { [self] in
-      let start = Date()
-      try requireInputContext(phoneID: phoneID, context: context)
-      guard !stopping, epochs[phoneID] == expected, deadline > start else {
-        throw KitError(
-          "CONNECTION_CHANGED",
-          "Action expired or connection changed while queued. Take a fresh screenshot.")
-      }
-      @MainActor func valid() -> Bool {
-        guard inputContextIsValid(phoneID: phoneID, context: context), !stopping,
-          epochs[phoneID] == expected
-        else { return false }
-        guard let current = phones.first(where: { $0.id == phoneID }),
-          command.action == .wake || current.status == .ready
-        else { return false }
-        guard let reference else { return isDemo || attached.contains(where: { $0.id == phoneID }) }
-        guard Date().timeIntervalSince(reference.capturedAt) <= 60, reference.epoch == expected
-        else { return false }
-        if isDemo { return true }
-        guard let captureID = reference.captureID, bindings[phoneID] == captureID,
-          let frame = screen.frame(captureID: captureID),
-          frame.geometryGeneration == reference.generation,
-          ProcessInfo.processInfo.systemUptime - frame.uptime < 3
-        else { return false }
-        return true
-      }
-      guard valid() else {
-        throw KitError(
-          "STALE_SCREENSHOT", "Screen changed or screenshot expired. Take a fresh screenshot.")
-      }
-      if let connection {
-        try await GestureRunner().run(
-          plan, transport: connection, epoch: linkEpoch, deadline: deadline, stillValid: valid)
-      } else {
-        try Task.checkCancellation()
-        try await Task.sleep(for: .milliseconds(20))
-        try Task.checkCancellation()
         try requireInputContext(phoneID: phoneID, context: context)
-        if command.action == .tap {
-          demo.checked.toggle()
-          demo.home = false
+        if let geometry = reference?.geometry, let x = command.toX ?? command.x,
+          let y = command.toY ?? command.y
+        {
+          pointers[phoneID] = (x / Double(geometry.width), y / Double(geometry.height))
         }
-        if command.action == .typeText { demo.text += command.text ?? "" }
-        if command.action == .pressHome { demo.home = true }
+        record("\(command.action.rawValue) input sent.")
+        return ActionResult(phoneID: phoneID, action: command.action, status: isDemo ? "simulated" : "sent",
+                            startedAt: start, epoch: expected, completedUptime: ProcessInfo.processInfo.systemUptime)
       }
-      try requireInputContext(phoneID: phoneID, context: context)
-      if let geometry = reference?.geometry, let x = command.toX ?? command.x,
-        let y = command.toY ?? command.y
-      {
-        pointers[phoneID] = (x / Double(geometry.width), y / Double(geometry.height))
-      }
-      record(
-        "\(command.action.rawValue) sent to \(phones.first(where: { $0.id == phoneID })?.name ?? "phone")."
-      )
-      return ActionResult(
-        phoneID: phoneID, action: command.action, status: isDemo ? "simulated" : "sent",
-        startedAt: start, epoch: expected)
     }
-  }
 
   public func cancel(phoneID: String) {
     // Public cancellation is the emergency stop and is allowed while a lease owns the phone.

@@ -155,41 +155,43 @@ struct GestureRunner {
     var sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
 
     func run(
-        _ plan: GesturePlan, transport: any ReportTransport, epoch: UInt64, deadline: Date?,
-        stillValid: () -> Bool
-    ) async throws {
-        do {
-            var previous = 0.0
-            for report in plan.reports {
-                let wait = report.milliseconds - previous
-                if wait > 0 { try await sleep(.microseconds(Int64(wait * 1000))) }
+            _ plan: GesturePlan, transport: any ReportTransport, epoch: UInt64, deadline: Date?,
+            stillValid: () -> Bool, authorization: GuardedInput? = nil
+        ) async throws {
+            var didDispatch = false
+            func checkValidity() throws {
                 try Task.checkCancellation()
-                guard deadline.map({ $0 > Date() }) ?? true else {
+                try authorization?.witness.check()
+                guard deadline.map({ value in value > Date() }) ?? true else {
                     throw KitError("DEADLINE_EXCEEDED", "Action deadline expired.")
                 }
                 guard transport.epoch == epoch, transport.isReady, stillValid() else {
-                    throw KitError(
-                        "CONNECTION_CHANGED",
-                        "Connection or screen geometry changed. Action was not replayed; inspect a fresh screenshot.")
+                    throw KitError("CONNECTION_CHANGED", "Connection or screen geometry changed. Inspect the phone.")
                 }
-                try await transport.send(report.bytes, epoch: epoch, deadline: deadline)
-                try Task.checkCancellation()
-                guard deadline.map({ deadline in deadline > Date() }) ?? true else {
-                    throw KitError("DEADLINE_EXCEEDED", "Action deadline expired.")
-                }
-                guard transport.epoch == epoch, transport.isReady, stillValid() else {
-                    throw KitError(
-                        "CONNECTION_CHANGED",
-                        "Connection or screen geometry changed. Action was not replayed; inspect a fresh screenshot.")
-                }
-                previous = report.milliseconds
             }
-        } catch {
-            // Never let an old operation send a release into a newer connection's operation.
-            if transport.epoch == epoch { transport.neutralize(epoch: epoch) }
-            throw error
+            do {
+                var previous = 0.0
+                for report in plan.reports {
+                    let wait = report.milliseconds - previous
+                    if wait > 0 { try await sleep(.microseconds(Int64(wait * 1000))) }
+                    try checkValidity()
+                    if !didDispatch {
+                        try await authorization?.authorize()
+                        try checkValidity()
+                        try authorization?.witness.beginDispatch()
+                        didDispatch = true
+                    }
+                    try await transport.send(report.bytes, epoch: epoch, deadline: deadline)
+                    try checkValidity()
+                    previous = report.milliseconds
+                }
+            } catch {
+                // A rejected guard sends no command reports. Cleanup after dispatch
+                // stays on the original connection and cannot undo an applied action.
+                if didDispatch, transport.epoch == epoch { transport.neutralize(epoch: epoch) }
+                throw error
+            }
         }
-    }
 }
 
 public extension PhoneCommand {

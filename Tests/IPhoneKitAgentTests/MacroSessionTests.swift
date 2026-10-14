@@ -40,6 +40,7 @@ private func generatedJPEG(token: String) -> Data {
 private final class FakeMacroPhone: ExclusivePhoneControlling {
     let phoneID = "macro-phone"
     let baselineDate = Date(timeIntervalSince1970: 1_700_000_000)
+    let baselineUptime: TimeInterval = 1_000
     var availablePhones: [PhoneInfo]
     var captures: [CaptureInfo] = []
     var events: [DiagnosticEvent] = []
@@ -47,9 +48,18 @@ private final class FakeMacroPhone: ExclusivePhoneControlling {
     var isDemo = true
 
     var now: Date
-    var fallbackToken = "wrong"
+    var uptime: TimeInterval = 1_000
+    var fallbackToken = "wrong" { didSet { currentImage = nil } }
     private var frameNumber = 0
     private var imageCache: [String: Data] = [:]
+    private var currentImage: Data?
+    private var insideGuard = false
+    private var activeExecutions = 0
+    var pendingTransportWrites = 0
+    var supportsGuarded = true
+    var advanceClockOnCapture = true
+    var repeatGuardTimestamp = false
+    var guardFrames: [Screenshot] = []
     private(set) var queuedScreenshots: [Screenshot] = []
     private(set) var screenshotRequests = 0
     var blockScreenshots = false
@@ -60,14 +70,15 @@ private final class FakeMacroPhone: ExclusivePhoneControlling {
     private(set) var acquireCount = 0
     private(set) var releaseCount = 0
     var executeFailure: KitError?
+    var beforeExecute: (@MainActor () -> Void)?
+    var afterDispatch: (@MainActor () -> Void)?
     var nextStatus = "sent"
     var blockExecution = false
     private var executeWaiters: [(PhoneCommand, CheckedContinuation<ActionResult, Never>)] = []
 
     init() {
-        let phone = PhoneInfo(id: phoneID, name: "Macro fixture", status: .ready,
-                              width: 390, height: 844, captureID: "capture-1", epoch: 1)
-        availablePhones = [phone]
+        availablePhones = [PhoneInfo(id: phoneID, name: "Macro fixture", status: .ready,
+                                    width: 390, height: 844, captureID: "capture-1", epoch: 1)]
         now = baselineDate
     }
 
@@ -80,20 +91,49 @@ private final class FakeMacroPhone: ExclusivePhoneControlling {
     func prepare(phoneID: String) async throws {}
     func bindCapture(phoneID: String, captureID: String) throws {}
     func execute(phoneID: String, command: PhoneCommand) async throws -> ActionResult {
-        try await executeLease(command)
+        prepareExecution()
+        return try await executeLease(command)
     }
     func cancel(phoneID: String) { cancelCount += 1 }
 
+    private func prepareExecution() {
+        let hook = beforeExecute
+        beforeExecute = nil
+        hook?()
+    }
+
     func acquireInput(phoneID: String) throws -> PhoneInputLease {
-        guard availablePhones.contains(where: { $0.id == phoneID && $0.status == .ready }) else {
+        guard availablePhones.contains(where: { phone in phone.id == phoneID && phone.status == .ready }) else {
             throw KitError("TEST_NO_PHONE", "The fixture phone is unavailable.")
         }
         acquireCount += 1
+        var guarded: (@MainActor (PhoneCommand, GuardedInput) async throws -> ActionResult)?
+        if supportsGuarded {
+            guarded = { [weak self] command, authorization in
+                guard let self else { throw KitError("TEST_LEASE_GONE", "The fixture lease disappeared.") }
+                activeExecutions += 1
+                defer { activeExecutions -= 1; insideGuard = false }
+                prepareExecution()
+                insideGuard = true
+                try await authorization.authorize()
+                insideGuard = false
+                try Task.checkCancellation()
+                try authorization.witness.beginDispatch()
+                afterDispatch?()
+                return try await executeLease(command)
+            }
+        }
         return PhoneInputLease(
             phoneID: phoneID,
             execute: { [weak self] command in
                 guard let self else { throw KitError("TEST_LEASE_GONE", "The fixture lease disappeared.") }
-                return try await self.executeLease(command)
+                prepareExecution()
+                return try await executeLease(command)
+            },
+            guardedExecute: guarded,
+            isDrained: { [weak self] in
+                guard let self else { return true }
+                return activeExecutions == 0 && pendingTransportWrites == 0
             },
             cancel: { [weak self] in self?.cancelCount += 1 },
             release: { [weak self] in self?.releaseCount += 1 }
@@ -103,59 +143,78 @@ private final class FakeMacroPhone: ExclusivePhoneControlling {
     func screenshot(phoneID: String, longEdge: Int) async throws -> Screenshot {
         screenshotRequests += 1
         if blockScreenshots {
-            return await withCheckedContinuation { screenshotWaiters.append($0) }
+            return await withCheckedContinuation { continuation in screenshotWaiters.append(continuation) }
         }
-        if !queuedScreenshots.isEmpty { return queuedScreenshots.removeFirst() }
-        return makeFrame(token: fallbackToken)
+        if insideGuard {
+            if !guardFrames.isEmpty { return deliver(guardFrames.removeFirst()) }
+            frameNumber += 1
+            let image = currentImage ?? jpeg(token: fallbackToken)
+            let delta = repeatGuardTimestamp ? 0 : 0.001
+            return deliver(frame(jpeg: image, id: "gate-\(frameNumber)", date: now.addingTimeInterval(delta),
+                                 capturedUptime: uptime + delta))
+        }
+        if !queuedScreenshots.isEmpty { return deliver(queuedScreenshots.removeFirst()) }
+        return deliver(makeFrame(token: fallbackToken))
     }
 
-    func enqueue(_ screenshot: Screenshot) {
-        queuedScreenshots.append(screenshot)
+    private func deliver(_ frame: Screenshot) -> Screenshot {
+        if advanceClockOnCapture {
+            now = max(now, frame.capturedAt)
+            uptime = max(uptime, frame.capturedUptime ?? uptime)
+        }
+        currentImage = frame.jpeg
+        return frame
     }
+
+    func enqueue(_ screenshot: Screenshot) { queuedScreenshots.append(screenshot) }
 
     func releaseScreenshots(token: String) {
         let waiters = screenshotWaiters
         screenshotWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume(returning: makeFrame(token: token))
-        }
+        for waiter in waiters { waiter.resume(returning: deliver(makeFrame(token: token))) }
     }
 
     func releaseExecutions(status: String = "sent") {
         let waiters = executeWaiters
         executeWaiters.removeAll()
-        for (command, waiter) in waiters {
-            waiter.resume(returning: result(for: command, status: status))
-        }
+        for (command, waiter) in waiters { waiter.resume(returning: result(for: command, status: status)) }
     }
 
-    func makeFrame(token: String, id: String? = nil, capturedAt: Date? = nil) -> Screenshot {
-        frameNumber += 1
-        let info = availablePhones.first(where: { $0.id == phoneID })
+    private func jpeg(token: String) -> Data {
+        let image = imageCache[token] ?? generatedJPEG(token: token)
+        imageCache[token] = image
+        return image
+    }
+
+    private func frame(jpeg: Data, id: String, date: Date, capturedUptime: TimeInterval?) -> Screenshot {
+        let info = availablePhones.first(where: { phone in phone.id == phoneID })
         let width = info?.width ?? 390
         let height = info?.height ?? 844
-        let epoch = info?.epoch ?? 1
-        let frameID = id ?? "frame-\(frameNumber)"
-        let date = capturedAt ?? baselineDate.addingTimeInterval(Double(frameNumber) / 100)
-        let jpeg = imageCache[token] ?? generatedJPEG(token: token)
-        imageCache[token] = jpeg
-        return Screenshot(id: frameID, phoneID: phoneID, epoch: epoch,
-                          width: width, height: height,
-                          nativeWidth: width, nativeHeight: height,
-                          capturedAt: date, jpeg: jpeg)
+        return Screenshot(id: id, phoneID: phoneID, epoch: info?.epoch ?? 1,
+                          width: width, height: height, nativeWidth: width, nativeHeight: height,
+                          capturedAt: date, jpeg: jpeg, capturedUptime: capturedUptime)
+    }
+
+    func makeFrame(token: String, id: String? = nil, capturedAt: Date? = nil,
+                   capturedUptime: TimeInterval? = nil) -> Screenshot {
+        frameNumber += 1
+        let stamp = capturedUptime ?? capturedAt.map { date in baselineUptime + date.timeIntervalSince(baselineDate) }
+            ?? max(baselineUptime + Double(frameNumber) / 100, uptime + 0.01)
+        let date = capturedAt ?? now.addingTimeInterval(stamp - uptime)
+        return frame(jpeg: jpeg(token: token), id: id ?? "frame-\(frameNumber)", date: date, capturedUptime: stamp)
     }
 
     private func result(for command: PhoneCommand, status: String) -> ActionResult {
         ActionResult(phoneID: phoneID, action: command.action, status: status,
-                     startedAt: now, completedAt: now,
-                     epoch: availablePhones.first(where: { $0.id == phoneID })?.epoch ?? 1)
+                     startedAt: now, completedAt: now, epoch: availablePhones.first?.epoch ?? 1,
+                     completedUptime: uptime)
     }
 
     private func executeLease(_ command: PhoneCommand) async throws -> ActionResult {
         commands.append(command)
         if let executeFailure { throw executeFailure }
         if blockExecution {
-            return await withCheckedContinuation { executeWaiters.append((command, $0)) }
+            return await withCheckedContinuation { continuation in executeWaiters.append((command, continuation)) }
         }
         return result(for: command, status: nextStatus)
     }
@@ -165,6 +224,13 @@ private actor FakeMacroMatcher: VisualMatching {
     private(set) var receivedScreenshotIDs: [String] = []
     private(set) var calls = 0
     private var suspendNext = false
+        private var contextResult: Bool?
+
+    func setContextResult(_ value: Bool?) { contextResult = value }
+
+    func matchesContext(_ anchor: VisualAnchor, screenshot: Screenshot) async throws -> Bool {
+            contextResult ?? (anchor.image == screenshot.jpeg)
+        }
     private var waiters: [CheckedContinuation<Bool, Never>] = []
 
     var waiting: Bool { !waiters.isEmpty }
@@ -257,8 +323,8 @@ func approvedExecutionUsesFreshLiveFramesAndBoundedUniqueCommands() async throws
     [firstProposalFrame, firstLiveFrame, firstAfterFrame,
      secondProposalFrame, secondLiveFrame, secondAfterFrame].forEach(controller.enqueue)
 
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
     try session.start(profile: profile, phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
     let firstProposal = try #require(session.proposal)
@@ -286,8 +352,8 @@ func beforeMismatchTimesOutWithoutExecutingOrReplaying() async throws {
     controller.fallbackToken = "not-before"
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Guarded", before: "expected", after: "after", requiresApproval: false)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .paused }
@@ -304,8 +370,8 @@ func pollingUsesSeveralFreshFramesBeforeTheMatch() async throws {
     let matching = controller.makeFrame(token: "wanted")
     let after = controller.makeFrame(token: "done")
     [wrongOne, wrongTwo, matching, after].forEach(controller.enqueue)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .completed }
@@ -323,8 +389,8 @@ func uncertainInputOutcomeIsNeverReplayed() async throws {
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Uncertain", before: "before", after: "after", requiresApproval: false)
     controller.enqueue(controller.makeFrame(token: "before"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .paused }
@@ -339,8 +405,8 @@ func stopDuringScreenshotPreventsLaterInput() async throws {
     controller.blockScreenshots = true
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Screenshot gate", before: "before", after: "after", requiresApproval: false)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { controller.screenshotWaiterCount == 1 }
@@ -359,8 +425,8 @@ func stopDuringMatchingPreventsLaterInput() async throws {
     await matcher.suspendNextMatch()
     let step = try makeStep(controller, name: "Matcher gate", before: "before", after: "after", requiresApproval: false)
     controller.enqueue(controller.makeFrame(token: "before"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntilAsync { await matcher.waiting }
@@ -376,14 +442,15 @@ func stopDuringApprovalRejectsStaleApprovalAndDoesNotApproveNewRun() async throw
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Approval one", before: "one", after: "one-done")
     controller.enqueue(controller.makeFrame(token: "one"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
     let staleID = try #require(session.proposal?.id)
     session.stop()
 
-    let replacement = try makeStep(controller, name: "Approval two", before: "two", after: "two-done")
+    try await waitUntil { session.state == .stopped }
+        let replacement = try makeStep(controller, name: "Approval two", before: "two", after: "two-done")
     let replacementFrame = controller.makeFrame(token: "two")
     let replacementLive = controller.makeFrame(token: "two")
     let replacementAfter = controller.makeFrame(token: "two-done")
@@ -400,20 +467,26 @@ func stopDuringApprovalRejectsStaleApprovalAndDoesNotApproveNewRun() async throw
     #expect(controller.commands.count == 1)
 }
 
-@Test @MainActor
-func supersededOldCompletionCannotMutateTheNewRun() async throws {
+@Test @MainActor func stoppingWaitsForOldWorkBeforeStartingNewRun() async throws {
     let controller = FakeMacroPhone()
     let matcher = FakeMacroMatcher()
     await matcher.suspendNextMatch()
     let oldStep = try makeStep(controller, name: "Old", before: "old", after: "old-done", requiresApproval: false)
     controller.enqueue(controller.makeFrame(token: "old"))
     let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+                               pollInterval: .milliseconds(1), now: { controller.now }, uptime: { controller.uptime })
     try session.start(profile: makeProfile([oldStep]), phoneID: controller.phoneID)
     try await waitUntilAsync { await matcher.waiting }
     session.stop()
-
+    let frozen = try #require(session.recovery)
+    #expect(session.state == .stopping)
+    #expect(frozen.outcome == .notDispatched)
     let newStep = try makeStep(controller, name: "New", before: "new", after: "new-done", requiresApproval: false)
+    #expect(throws: KitError.self) { try session.start(profile: makeProfile([newStep]), phoneID: controller.phoneID) }
+    await matcher.releaseAll()
+    try await waitUntil { session.state == .stopped }
+    #expect(session.recovery == frozen)
+    #expect(controller.commands.isEmpty)
     let newBefore = controller.makeFrame(token: "new")
     let newAfter = controller.makeFrame(token: "new-done")
     [newBefore, newAfter].forEach(controller.enqueue)
@@ -421,11 +494,7 @@ func supersededOldCompletionCannotMutateTheNewRun() async throws {
     try await waitUntil { session.state == .completed }
     #expect(controller.commands.count == 1)
     #expect(controller.commands[0].screenshotID == newBefore.id)
-
-    await matcher.releaseAll()
-    await Task.yield()
-    #expect(session.state == .completed)
-    #expect(controller.commands.count == 1)
+    #expect(session.recovery == nil)
 }
 
 @MainActor
@@ -434,8 +503,8 @@ private func assertPinnedChange(_ change: (FakeMacroPhone) -> Void) async throws
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Pinned", before: "before", after: "after")
     controller.enqueue(controller.makeFrame(token: "before"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
     change(controller)
@@ -477,8 +546,8 @@ func bufferedOldFrameWithNewIDCannotVerifyAfterAction() async throws {
     let staleAfter = controller.makeFrame(token: "after", capturedAt: controller.now)
     let freshWrong = controller.makeFrame(token: "wrong")
     [before, staleAfter, freshWrong].forEach(controller.enqueue)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .paused }
@@ -497,8 +566,8 @@ func approvalRechecksTheScreenBeforeSending() async throws {
     let proposalFrame = controller.makeFrame(token: "before")
     let changedFrame = controller.makeFrame(token: "changed")
     [proposalFrame, changedFrame].forEach(controller.enqueue)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
@@ -518,8 +587,8 @@ func maximumActionsStopsBeforeASecondProposal() async throws {
     let firstLive = controller.makeFrame(token: "one")
     let firstAfter = controller.makeFrame(token: "one-done")
     [firstProposal, firstLive, firstAfter].forEach(controller.enqueue)
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([first, second], maximumActions: 1), phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
@@ -537,8 +606,8 @@ func timeBudgetContinuesWhileApprovalIsPending() async throws {
     let matcher = FakeMacroMatcher()
     let step = try makeStep(controller, name: "Timed approval", before: "before", after: "after")
     controller.enqueue(controller.makeFrame(token: "before"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([step], maximumSeconds: 5), phoneID: controller.phoneID)
     try await waitUntil { session.state == .awaitingApproval }
@@ -559,8 +628,8 @@ func stopConditionCompletesBeforeAnyInput() async throws {
     controller.enqueue(stopFrame)
     var profile = makeProfile([step])
     profile.stopWhen = try VisualAnchor(screenshot: stopFrame, expectedText: "stop")
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: profile, phoneID: controller.phoneID)
     try await waitUntil { session.state == .completed }
@@ -569,16 +638,15 @@ func stopConditionCompletesBeforeAnyInput() async throws {
     #expect(session.message.contains("stop screen"))
 }
 
-@Test @MainActor
-func stopDuringExecutePreventsSubsequentActions() async throws {
+@Test @MainActor func stopDuringExecutePreventsSubsequentActions() async throws {
     let controller = FakeMacroPhone()
     controller.blockExecution = true
     let matcher = FakeMacroMatcher()
     let first = try makeStep(controller, name: "In flight", before: "one", after: "one-done", requiresApproval: false)
     let second = try makeStep(controller, name: "Must not run", before: "two", after: "two-done", requiresApproval: false)
     controller.enqueue(controller.makeFrame(token: "one"))
-    let session = MacroSession(controller: controller, matcher: matcher,
-                               pollInterval: .milliseconds(1), now: { controller.now })
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
 
     try session.start(profile: makeProfile([first, second]), phoneID: controller.phoneID)
     try await waitUntil { controller.executeWaiterCount == 1 }
@@ -587,4 +655,36 @@ func stopDuringExecutePreventsSubsequentActions() async throws {
     try await waitUntil { session.state == .stopped }
     #expect(controller.commands.count == 1)
     #expect(session.actionCount == 1)
+
+}
+
+@Test @MainActor func changedScreenAtDispatchDoesNotSendInput() async throws {
+    let controller = FakeMacroPhone()
+    controller.fallbackToken = "before"
+    controller.beforeExecute = {
+        controller.fallbackToken = "overlay"
+        controller.nextStatus = "unknown"
+    }
+    let matcher = FakeMacroMatcher()
+    let step = try makeStep(controller, name: "Guarded dispatch", before: "before", after: "after", requiresApproval: false)
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
+    try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
+    try await waitUntil { session.state == .paused }
+    #expect(controller.commands.isEmpty)
+    #expect(session.actionCount == 0)
+}
+
+@Test @MainActor func macroErrorsDoNotExposeRawFailureText() async throws {
+    let controller = FakeMacroPhone()
+    controller.fallbackToken = "before"
+    let canary = "private-failure-canary@example.invalid"
+    controller.executeFailure = KitError("UNRECOGNIZED_BACKEND", canary)
+    let matcher = FakeMacroMatcher()
+    let step = try makeStep(controller, name: "Private step", before: "before", after: "after", requiresApproval: false)
+    let session = MacroSession(controller: controller, matcher: matcher, pollInterval: .milliseconds(1), now: { controller.now },
+                                   uptime: { controller.uptime })
+    try session.start(profile: makeProfile([step]), phoneID: controller.phoneID)
+    try await waitUntil { session.state == .paused }
+    #expect(!session.message.contains(canary))
 }

@@ -73,7 +73,7 @@ final class MCPBridge {
             initialized = true
             result(id, ["protocolVersion": supported.contains(offered) ? offered : "2025-06-18",
                         "capabilities": ["tools": ["listChanged": false]],
-                        "serverInfo": ["name": "iPhoneKit", "version": "0.1.0"],
+                        "serverInfo": ["name": "iPhoneKit", "version": "0.1.1"],
                         "instructions": "Local iPhone control. Take a screenshot before pointer actions and pass its screenshot_id; coordinates refer to that JPEG. Use portrait orientation. Input is sent, not proof of task completion: screenshot again. Typing is US-ASCII and iOS may auto-capitalise. Ask before purchases, messages, deleting data, or sharing private content."])
             return
         }

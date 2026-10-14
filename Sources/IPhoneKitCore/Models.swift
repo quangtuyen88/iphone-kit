@@ -80,15 +80,18 @@ public struct Screenshot: Identifiable, Codable, Sendable {
     public let pointerX: Double?
     public let pointerY: Double?
     public let pointerVisible: Bool?
-public let orientation: String
+    public let orientation: String
+    public let capturedUptime: TimeInterval?
     public init(id: String = UUID().uuidString, phoneID: String, epoch: UInt64, width: Int, height: Int,
                 nativeWidth: Int, nativeHeight: Int, capturedAt: Date, jpeg: Data,
-                pointerX: Double? = nil, pointerY: Double? = nil, pointerVisible: Bool? = nil) {
+                pointerX: Double? = nil, pointerY: Double? = nil, pointerVisible: Bool? = nil,
+                capturedUptime: TimeInterval? = nil) {
         self.id = id; self.phoneID = phoneID; self.epoch = epoch
         self.width = width; self.height = height; self.nativeWidth = nativeWidth; self.nativeHeight = nativeHeight
         self.capturedAt = capturedAt; self.jpeg = jpeg
         self.pointerX = pointerX; self.pointerY = pointerY; self.pointerVisible = pointerVisible
         self.orientation = nativeWidth > nativeHeight ? "landscape" : "portrait"
+        self.capturedUptime = capturedUptime
     }
 }
 
@@ -143,10 +146,13 @@ public struct ActionResult: Identifiable, Codable, Sendable {
     public let completedAt: Date
     public let epoch: UInt64
     public let message: String
+    public let completedUptime: TimeInterval?
     public init(id: String = UUID().uuidString, phoneID: String, action: PhoneAction, status: String = "sent",
-                startedAt: Date, completedAt: Date = Date(), epoch: UInt64, message: String = "Input sent. Take a screenshot to verify the result.") {
+                startedAt: Date, completedAt: Date = Date(), epoch: UInt64,
+                message: String = "Input sent. Take a screenshot to verify the result.", completedUptime: TimeInterval? = nil) {
         self.id = id; self.phoneID = phoneID; self.action = action; self.status = status
         self.startedAt = startedAt; self.completedAt = completedAt; self.epoch = epoch; self.message = message
+        self.completedUptime = completedUptime
     }
 }
 

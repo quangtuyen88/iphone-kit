@@ -91,6 +91,7 @@ struct EncodedFrame: Sendable {
     let nativeWidth: Int
     let nativeHeight: Int
     let capturedAt: Date
+    let uptime: TimeInterval
     let geometryGeneration: UInt64
 }
 
@@ -187,7 +188,7 @@ func requestPermission() async throws {
         CGImageDestinationAddImage(destination, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw KitError("ENCODING_FAILED", "Screenshot encoding failed.") }
         return EncodedFrame(jpeg: data as Data, width: width, height: height, nativeWidth: frame.width, nativeHeight: frame.height,
-                            capturedAt: frame.capturedAt, geometryGeneration: frame.geometryGeneration)
+                            capturedAt: frame.capturedAt, uptime: frame.uptime, geometryGeneration: frame.geometryGeneration)
     }
 
     func stop() async {
