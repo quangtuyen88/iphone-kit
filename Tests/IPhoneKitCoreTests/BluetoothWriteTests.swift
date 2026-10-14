@@ -34,8 +34,11 @@ import Testing
         return status
     }
 
-    func writer(timeout: Duration = .seconds(2)) -> L2CAPWriter {
-        L2CAPWriter(timeout: timeout) { buffer, length, refcon in
+    func writer(
+        timeout: Duration = .seconds(2),
+        sleep: @escaping @MainActor (Duration) async throws -> Void = { duration in try await Task.sleep(for: duration) }
+    ) -> L2CAPWriter {
+        L2CAPWriter(timeout: timeout, sleep: sleep) { buffer, length, refcon in
             self.submit(buffer, length: length, refcon: refcon)
         }
     }
@@ -86,21 +89,41 @@ import Testing
 
 @Test @MainActor func cancelledInFlightWriteResumesOnceAndKeepsItsWatchdog() async throws {
     let probe = WriteProbe()
-    let writer = probe.writer(timeout: .milliseconds(40))
-    let failure = AsyncStream<Void>.makeStream()
-    writer.failed = {
-        failure.continuation.yield(())
-        failure.continuation.finish()
+    let watchdog = AsyncStream<Void>.makeStream()
+    var watchdogEntered = false
+    let writer = probe.writer(timeout: .milliseconds(40), sleep: { duration in
+        #expect(duration == .milliseconds(40))
+        watchdogEntered = true
+        for await _ in watchdog.stream {}
+        try Task.checkCancellation()
+    })
+    defer {
+        watchdog.continuation.finish()
+        writer.invalidate()
     }
+    var failures = 0
+    writer.failed = { failures += 1 }
     let task = Task { @MainActor in try await writer.write(HIDReports.keyboard()) }
     try await probe.waitForSubmission()
+    let entryDeadline = ContinuousClock.now + .seconds(2)
+    while !watchdogEntered {
+        try #require(ContinuousClock.now < entryDeadline, "Watchdog was not armed.")
+        await Task.yield()
+    }
     task.cancel()
     do {
         try await task.value
         Issue.record("Expected cancellation")
     } catch { #expect(error is CancellationError) }
     #expect(writer.pendingCount == 1)
-    for await _ in failure.stream {}
+    #expect(failures == 0)
+    watchdog.continuation.finish()
+    let failureDeadline = ContinuousClock.now + .seconds(2)
+    while failures == 0 {
+        try #require(ContinuousClock.now < failureDeadline, "Cancelled write lost its watchdog.")
+        await Task.yield()
+    }
+    #expect(failures == 1)
     #expect(writer.pendingCount == 0)
     #expect(throws: KitError.self) { try writer.enqueue(HIDReports.keyboard()) }
 }

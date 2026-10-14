@@ -34,6 +34,7 @@ final class L2CAPWriter {
     private static var nextIdentifier: UInt = 0
     private let submit: (UnsafeMutableRawPointer, UInt16, UnsafeMutableRawPointer) -> IOReturn
     private let timeout: Duration
+    private let sleep: @MainActor (Duration) async throws -> Void
     private var isOpen = true
     private var pending: [UInt: PendingWrite] = [:]
     private var queue: [UInt] = []
@@ -44,9 +45,11 @@ final class L2CAPWriter {
 
     init(
         timeout: Duration = .seconds(2),
+        sleep: @escaping @MainActor (Duration) async throws -> Void = { duration in try await Task.sleep(for: duration) },
         submit: @escaping (UnsafeMutableRawPointer, UInt16, UnsafeMutableRawPointer) -> IOReturn
     ) {
         self.timeout = timeout
+        self.sleep = sleep
         self.submit = submit
     }
 
@@ -89,8 +92,9 @@ final class L2CAPWriter {
         pending[identifier] = write
         queue.append(identifier)
         let wait = min(timeout, maximumWait ?? timeout)
+        let sleep = self.sleep
         write.timeout = Task { [weak self] in
-            do { try await Task.sleep(for: wait) } catch { return }
+            do { try await sleep(wait) } catch { return }
             guard let self, pending[identifier] != nil else { return }
             invalidate(
                 error: KitError(
